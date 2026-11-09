@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Biometric face data (NEVER commit user facial embeddings)
+users/*.json
+!users/.gitkeep
+
+# System logs and temporary files
+*.log
+/var/log/face-auth.log
+*.tmp
+*.swp
+*~
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS generated files
+.DS_Store
+Thumbs.db

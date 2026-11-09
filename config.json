@@ -1,0 +1,15 @@
+{
+  "camera_id": 0,
+  "frame_width": 640,
+  "frame_height": 480,
+  "detection_threshold": 0.65,
+  "recognition_threshold": 0.38,
+  "timeout_seconds": 3.0,
+  "required_matches": 2,
+  "warmup_frames": 2,
+  "min_face_size": 80,
+  "disable_lid_closed": true,
+  "feedback": true,
+  "liveness_check": false,
+  "log_file": "/var/log/face-auth.log"
+}

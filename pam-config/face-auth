@@ -1,0 +1,6 @@
+Name: Face authentication
+Default: yes
+Priority: 265
+Auth-Type: Primary
+Auth:
+	[success=end default=ignore]	pam_exec.so quiet stdout /usr/local/bin/face-auth-verify
