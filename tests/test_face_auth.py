@@ -154,5 +154,25 @@ class TestEnvironmentSafety(unittest.TestCase):
         self.assertFalse(face_auth.is_remote_session())
 
 
+class TestFreshLogin(unittest.TestCase):
+    def test_unknown_user_has_no_session(self):
+        self.assertFalse(face_auth.has_active_session("no_such_user_zzz"))
+
+    def test_login_services(self):
+        self.assertIn("gdm-password", face_auth.LOGIN_SERVICES)
+        self.assertNotIn("sudo", face_auth.LOGIN_SERVICES)
+
+
+class TestFacePose(unittest.TestCase):
+    def test_frontal_and_degenerate(self):
+        face = np.zeros(15, dtype=np.float32)
+        face[4:14] = [40, 50, 80, 50, 60, 70, 45, 90, 75, 90]
+        yaw, pitch = face_auth.face_pose(face)
+        self.assertAlmostEqual(yaw, 0.0)
+        self.assertAlmostEqual(pitch, 0.5)
+        face[4:14] = [40, 50, 80, 50, 60, 50, 45, 50, 75, 50]
+        self.assertIsNone(face_auth.face_pose(face))
+
+
 if __name__ == "__main__":
     unittest.main()

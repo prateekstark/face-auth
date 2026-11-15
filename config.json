@@ -10,6 +10,7 @@
   "min_face_size": 80,
   "disable_lid_closed": true,
   "feedback": true,
+  "require_password_for_login": true,
   "liveness_check": false,
   "log_file": "/var/log/face-auth.log"
 }
