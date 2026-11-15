@@ -7,7 +7,7 @@
 ### Key Security Principles
 
 1. **Additive & Non-Destructive PAM Stacking**:
-   FaceAuth is configured in PAM via `[success=end default=ignore]`. This ensures:
+   FaceAuth is configured in PAM via `[success=end default=ignore]` (rewritten by `pam-auth-update`). This ensures:
    - If facial verification succeeds, access is granted.
    - If verification fails, times out, or encounters any error, PAM immediately falls through to the next configured authentication module (standard Unix password prompt).
    - FaceAuth **never** locks you out of your system.
@@ -32,3 +32,6 @@
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in FaceAuth, please report it privately rather than opening a public issue. Open an advisory via GitHub Security Advisories or contact the repository maintainers directly.
+
+6. **Keyring-Safe Login**:
+   A successful face scan skips the password module, so `pam_gnome_keyring` never receives a password and cannot unlock the login keyring. By default (`require_password_for_login: true`) FaceAuth declines on login services (`gdm-password`, `sddm`, `lightdm`, `login`, ...) when the user has no active session yet. After login, face unlock of the lock screen and `sudo` work as before.

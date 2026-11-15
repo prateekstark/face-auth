@@ -46,6 +46,10 @@ DEFAULT_CONFIG = {
     "disable_lid_closed": True,
     "feedback": True,               # User feedback during authentication
     "feedback_tty": True,           # Kept for backward compatibility
+    # Fresh graphical/console login has no password for pam_gnome_keyring, so the
+    # login keyring (Wi-Fi, browser, SSH secrets) would stay locked. Require the
+    # password until the user already has a session; face unlocks the lock screen.
+    "require_password_for_login": True,
     "liveness_check": False,        # Optional motion variance check
     "log_file": "/var/log/face-auth.log"
 }
@@ -76,7 +80,7 @@ def get_config(custom_path=None):
             with open(conf_path, "r") as f:
                 cfg.update(json.load(f))
         except Exception as e:
-            log_msg(f"Config load error: {e}")
+            log_msg(f"Config load error: {e}", cfg)
 
     # Synchronize feedback flags
     if "feedback" in cfg:
@@ -151,6 +155,34 @@ def is_remote_session():
     return False
 
 
+LOGIN_SERVICES = {
+    "gdm-password", "gdm-autologin", "gdm-fingerprint", "gdm-smartcard",
+    "sddm", "lightdm", "lxdm", "login", "greetd", "cosmic-greeter",
+}
+
+
+def has_active_session(username: str) -> bool:
+    """True if the user already has a local login session (so keyring is unlocked)."""
+    try:
+        import pwd
+        uid = str(pwd.getpwnam(username).pw_uid)
+    except Exception:
+        return False
+    for f in Path("/run/systemd/sessions").glob("*"):
+        try:
+            info = dict(
+                line.split("=", 1) for line in f.read_text().splitlines() if "=" in line
+            )
+        except Exception:
+            continue
+        if (info.get("UID") == uid
+                and info.get("CLASS") == "user"
+                and info.get("TYPE") in ("x11", "wayland", "mir", "tty")
+                and info.get("STATE") in ("active", "online")):
+            return True
+    return False
+
+
 def log_msg(msg: str, config=None):
     """Log formatted entry to log file."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -164,6 +196,40 @@ def log_msg(msg: str, config=None):
                 f.write(formatted)
     except Exception:
         pass
+
+
+def face_pose(face):
+    """Rough head pose from YuNet landmarks: (yaw, pitch).
+    yaw: nose offset from eye midpoint / eye distance (+ = head turned to user's left,
+    camera not mirrored). pitch: nose position between eye line and mouth line
+    (smaller = chin up, larger = chin down)."""
+    pts = np.array(face[4:14], dtype=np.float32).reshape(5, 2)
+    r_eye, l_eye, nose, r_mouth, l_mouth = pts
+    eye_mid = (r_eye + l_eye) / 2
+    mouth_mid = (r_mouth + l_mouth) / 2
+    eye_dist = abs(l_eye[0] - r_eye[0])
+    vert = mouth_mid[1] - eye_mid[1]
+    if eye_dist < 1 or vert < 1:
+        return None
+    return float((nose[0] - eye_mid[0]) / eye_dist), float((nose[1] - eye_mid[1]) / vert)
+
+
+# Per enrollment step: (yaw_min, yaw_max, pitch_delta_min, pitch_delta_max)
+# pitch_delta is relative to the neutral pose measured in step 1.
+POSE_TARGETS = [
+    (-0.10, 0.10, -0.06, 0.06),   # 1 straight
+    (-0.10, 0.10, -0.06, 0.06),   # 2 smile
+    (0.12, 0.60, -0.08, 0.08),    # 3 turn left
+    (-0.60, -0.12, -0.08, 0.08),  # 4 turn right
+    (-0.10, 0.10, -0.30, -0.06),  # 5 chin up
+    (-0.10, 0.10, 0.06, 0.30),    # 6 chin down
+    (-0.10, 0.10, -0.06, 0.06),   # 7 straight, angle variation
+    (-0.10, 0.10, -0.06, 0.06),   # 8 final
+]
+ENROLL_READY_DELAY = 2.0   # seconds to read the prompt before capture starts
+ENROLL_HOLD_FRAMES = 4     # consecutive in-pose frames required
+ENROLL_STEP_TIMEOUT = 15.0
+ENROLL_MIN_SAMPLES = 6
 
 
 class FacePipeline:
@@ -331,10 +397,10 @@ class UserManager:
             "embeddings_count": len(serializable),
             "embeddings": serializable
         }
-        with open(u_file, "w") as f:
+        # Create with 0600 from the start: no window where file is world-readable
+        fd = os.open(u_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(payload, f, indent=2)
-
-        # Secure file permissions (rw-------)
         try:
             os.chmod(u_file, 0o600)
         except Exception:
@@ -457,6 +523,7 @@ def cmd_enroll(args):
     ]
 
     enrolled_embeddings = []
+    neutral_pitch = None
     min_size = int(pipeline.config.get("min_face_size", 80))
 
     has_gui = not args.no_gui and bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
@@ -475,6 +542,9 @@ def cmd_enroll(args):
             print(f"[*] Step {prompt}...")
             sample_captured = False
             start_step = time.time()
+            ready_at = start_step + ENROLL_READY_DELAY
+            hold = 0
+            y_lo, y_hi, p_lo, p_hi = POSE_TARGETS[i]
 
             while not sample_captured:
                 ret, frame = cap.read()
@@ -536,16 +606,34 @@ def cmd_enroll(args):
                         print("\nEnrollment cancelled by user.")
                         return 1
 
-                # Capture condition: stable face detected
-                if best_face is not None:
-                    feat = pipeline.extract_embedding(frame, best_face)
+                # Capture condition: prompt read, pose matches, held for several frames
+                in_pose = False
+                if best_face is not None and time.time() >= ready_at:
+                    pose = face_pose(best_face)
+                    if pose is not None:
+                        yaw, pitch = pose
+                        # Baseline only from straight-facing steps (1, 2, 7, 8)
+                        if neutral_pitch is None and i in (0, 1, 6, 7):
+                            neutral_pitch = pitch
+                        in_pose = (neutral_pitch is not None
+                                   and y_lo <= yaw <= y_hi
+                                   and p_lo <= pitch - neutral_pitch <= p_hi)
+                hold = hold + 1 if in_pose else 0
+
+                if hold >= ENROLL_HOLD_FRAMES:
+                    try:
+                        feat = pipeline.extract_embedding(frame, best_face)
+                    except cv2.error as e:
+                        log_msg(f"Enroll embedding error: {e}")
+                        hold = 0
+                        continue
                     enrolled_embeddings.append(feat)
                     sample_captured = True
                     print(f"    ✓ Captured sample {i + 1}/{len(prompts)}")
                     time.sleep(0.4)
                     break
 
-                if time.time() - start_step > 10.0:
+                if time.time() - start_step > ENROLL_STEP_TIMEOUT:
                     print("    ⚠ Timeout waiting for face. Moving to next sample...")
                     break
                 time.sleep(0.03)
@@ -558,13 +646,18 @@ def cmd_enroll(args):
         if has_gui:
             cv2.destroyAllWindows()
 
-    if len(enrolled_embeddings) < 3:
+    if len(enrolled_embeddings) < ENROLL_MIN_SAMPLES:
         print(f"\n❌ Enrollment failed: Only {len(enrolled_embeddings)} valid samples were captured.")
         print("Please ensure your camera is functioning and your face is well-lit.")
         return 1
 
     user_mgr = UserManager()
-    saved_path = user_mgr.save_embeddings(username, enrolled_embeddings)
+    try:
+        saved_path = user_mgr.save_embeddings(username, enrolled_embeddings)
+    except (OSError, ValueError) as e:
+        print(f"❌ Error: could not save biometric profile: {e}", file=sys.stderr)
+        log_msg(f"Enroll save error for '{username}': {e}")
+        return 1
 
     print(f"\n🎉 Successfully enrolled {len(enrolled_embeddings)} biometric samples for '{username}'!")
     print(f"   Stored at: {saved_path}")
@@ -590,6 +683,13 @@ def cmd_verify(args):
         sys.exit(1)
 
     config = get_config(args.config if hasattr(args, 'config') else None)
+
+    # Fresh login: need password so the login keyring unlocks
+    if (config.get("require_password_for_login", True)
+            and os.environ.get("PAM_SERVICE", "").lower() in LOGIN_SERVICES
+            and not has_active_session(username)):
+        log_msg(f"Verify bypassed: fresh login for {username}, password needed to unlock keyring")
+        sys.exit(1)
 
     # Lid check
     if config.get("disable_lid_closed", True) and is_lid_closed():
